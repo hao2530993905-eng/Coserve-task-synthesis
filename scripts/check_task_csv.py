@@ -1,4 +1,4 @@
-"""Check task metadata and links to rubric details without running acceptance."""
+"""Check task metadata and paired preparation/evaluation files without executing them."""
 
 import argparse
 import csv
@@ -7,7 +7,6 @@ import json
 import re
 from collections import Counter
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from urllib.parse import unquote
 
 
 HEADERS = ["任务", "难度", "是否需要多轮交互", "任务来源", "任务处理模态", "上传文件", "rubric", "验收方式", "环境准备"]
@@ -19,52 +18,56 @@ SCRIPTED_TURN = re.compile(r"(?:^|\n)\s*(?:首轮|第[一二三四五六七八�
 THERMAL = re.compile(r"热分析|热仿真|散热优化|稳态导热|瞬态导热|热传导(?:分析|仿真)|\bthermal\s+(?:analysis|simulation)\b", re.IGNORECASE)
 
 
-def rule_sections(text: str, errors: list[str]) -> dict[str, str]:
-    """Read task sections and ignore headings inside fenced examples."""
-    lines = []
-    fence_char = ""
-    fence_length = 0
-    for line in text.splitlines():
-        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
-        if marker:
-            token, suffix = marker.groups()
-            if not fence_char:
-                fence_char, fence_length = token[0], len(token)
-            elif token[0] == fence_char and len(token) >= fence_length and not suffix.strip():
-                fence_char, fence_length = "", 0
-            lines.append("")
-        else:
-            lines.append("" if fence_char else line)
-    visible = "\n".join(lines)
-    headings = list(re.finditer(r"^(#{1,2})[ \t]+([^\n]+?)[ \t]*$", visible, re.MULTILINE))
-    sections = {}
-    for index, heading in enumerate(headings):
-        task_id = heading.group(2)
-        if heading.group(1) != "##" or not TASK_ID.fullmatch(task_id):
+def task_asset_id(directory: Path, rubric: str, method: str, preparation: str, number: int, errors: list[str]) -> str | None:
+    """Check declared preparation/evaluation files and return their common task ID without executing them."""
+    required = {
+        "程序验收": {"程序入口"},
+        "额外模型主观评价": {"模型提示词"},
+        "混合验收": {"程序入口", "模型提示词"},
+    }[method] | {"环境脚本"}
+    task_ids = set()
+    for label, folder, filename, text, field in [
+        ("环境脚本", "environments", "prepare.py", preparation, "环境准备"),
+        ("程序入口", "evaluators", "check.py", rubric, "rubric"),
+        ("模型提示词", "evaluators", "judge_prompt.txt", rubric, "rubric"),
+    ]:
+        entries = re.findall(rf"^[ \t]*{label}[：:][ \t]*([^\n]+)$", text, re.MULTILINE)
+        if not entries:
+            if label in required:
+                errors.append(f"第 {number} 条需要在{field}中注明{label}。")
             continue
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(visible)
-        if task_id in sections:
-            errors.append(f"详细说明中的任务 ID 重复：{task_id}")
-        sections[task_id] = visible[heading.end():end]
-    return sections
-
-
-def rubric_reference(summary: str) -> tuple[Path, str] | None:
-    """Return the single local Markdown detail link in a rubric summary."""
-    links = []
-    for target in re.findall(r"\[[^\]\n]*\]\(([^)\n]+)\)", summary):
-        target = target.removeprefix("<").removesuffix(">")
-        if "://" in target or "#" not in target:
+        if len(entries) != 1:
+            errors.append(f"第 {number} 条{label}只能声明一次。")
             continue
-        filename, task_id = target.rsplit("#", 1)
-        filename, task_id = unquote(filename), unquote(task_id)
-        if filename.lower().endswith(".md"):
-            links.append((Path(filename), task_id))
-    return links[0] if len(links) == 1 else None
+        relative = entries[0].strip()
+        match = re.fullmatch(rf"{folder}/({TASK_ID.pattern})/{re.escape(filename)}", relative)
+        if match is None:
+            errors.append(f"第 {number} 条{label}需为 {folder}/<task-id>/{filename}，任务 ID 使用小写字母、数字和连字符。")
+            continue
+        task_ids.add(match.group(1))
+        target = directory / relative
+        try:
+            if not target.resolve().is_relative_to(directory.resolve()):
+                errors.append(f"第 {number} 条{label}不能指向 CSV 所在目录之外：{relative}")
+                continue
+            content = target.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as error:
+            errors.append(f"第 {number} 条无法读取{label} {relative}：{error}")
+            continue
+        if not content.strip():
+            errors.append(f"第 {number} 条{label}文件为空：{relative}")
+        elif filename.endswith(".py"):
+            try:
+                compile(content, str(target), "exec")
+            except (SyntaxError, ValueError) as error:
+                errors.append(f"第 {number} 条{label}语法无效 {relative}：{error}")
+    if len(task_ids) > 1:
+        errors.append(f"第 {number} 条配套文件的任务 ID 不一致。")
+    return next(iter(task_ids)) if len(task_ids) == 1 else None
 
 
-def check(path: Path, expected: int | None, allow_thermal: bool, rubric_md: Path | None = None) -> dict:
-    """Return CSV and rubric-reference diagnostics without changing files."""
+def check(path: Path, expected: int | None, allow_thermal: bool) -> dict:
+    """Return CSV and paired-file diagnostics without running preparation, rollouts or model calls."""
     errors = []
     try:
         raw = path.read_bytes()
@@ -80,12 +83,6 @@ def check(path: Path, expected: int | None, allow_thermal: bool, rubric_md: Path
         errors.append("CSV 至少需要一条任务。")
     if expected is not None and len(records) != expected:
         errors.append(f"任务数为 {len(records)}，预期 {expected}。")
-    details_path = (rubric_md if rubric_md is not None else path.parent / "rubric与验收说明.md").resolve()
-    try:
-        sections = rule_sections(details_path.read_text(encoding="utf-8-sig"), errors)
-    except (OSError, UnicodeError) as error:
-        sections = None
-        errors.append(f"无法读取详细验收说明 {details_path}：{error}")
     seen = {}
     used_ids = {}
     levels, interactions, modalities, methods = Counter(), Counter(), Counter(), Counter()
@@ -127,46 +124,30 @@ def check(path: Path, expected: int | None, allow_thermal: bool, rubric_md: Path
             errors.append(f"第 {number} 条与第 {seen[normalized]} 条题面重复。")
         else:
             seen[normalized] = number
-        reference = rubric_reference(rubric)
-        if reference is None:
-            errors.append(f"第 {number} 条 rubric 需要一个本地详细说明 MD 的任务锚点链接。")
-        else:
-            filename, task_id = reference
-            target = (filename if filename.is_absolute() else path.parent / filename).resolve()
-            if target != details_path:
-                errors.append(f"第 {number} 条 rubric 链接与指定的详细说明文件不一致。")
-            if not TASK_ID.fullmatch(task_id):
-                errors.append(f"第 {number} 条任务锚点需使用小写字母、数字和连字符。")
-            elif task_id in used_ids:
-                errors.append(f"第 {number} 条与第 {used_ids[task_id]} 条共用了任务锚点 {task_id}。")
-            else:
-                used_ids[task_id] = number
-            if sections is not None:
-                section = sections.get(task_id)
-                if section is None:
-                    errors.append(f"第 {number} 条的任务锚点在详细说明中不存在：{task_id}")
+        if method in METHODS:
+            task_id = task_asset_id(path.parent, rubric, method, preparation, number, errors)
+            if task_id is not None:
+                if task_id in used_ids:
+                    errors.append(f"第 {number} 条与第 {used_ids[task_id]} 条共用了任务 ID {task_id}。")
                 else:
-                    declarations = re.findall(r"^验收方式[：:][ \t]*([^\n]+)$", section, re.MULTILINE)
-                    if len(declarations) != 1 or declarations[0].strip() != method:
-                        errors.append(f"第 {number} 条的验收方式与详细说明不一致或缺少唯一声明。")
+                    used_ids[task_id] = number
         levels[level] += 1
         interactions[multi] += 1
         modalities[modality] += 1
         methods[method] += 1
-    return {"ok": not errors, "count": len(records), "difficulty": dict(levels), "interaction": dict(interactions), "modalities": dict(modalities), "evaluation_methods": dict(methods), "rubric_md": str(details_path), "errors": errors}
+    return {"ok": not errors, "count": len(records), "difficulty": dict(levels), "interaction": dict(interactions), "modalities": dict(modalities), "evaluation_methods": dict(methods), "errors": errors}
 
 
 def main() -> int:
-    """Print a JSON report and fail when task metadata or links are invalid."""
-    parser = argparse.ArgumentParser(description="检查任务问题生成skill的九列 CSV、上传文件路径与独立验收说明。")
+    """Print a JSON report and fail when task metadata or paired preparation/evaluation files are invalid."""
+    parser = argparse.ArgumentParser(description="检查九列 CSV、上传文件路径及配套环境脚本、验收程序和评审提示词。")
     parser.add_argument("csv_path", type=Path)
     parser.add_argument("--expected-count", type=int)
-    parser.add_argument("--rubric-md", type=Path, help="默认读取 CSV 同目录的 rubric与验收说明.md。")
     parser.add_argument("--allow-thermal", action="store_true")
     args = parser.parse_args()
     if args.expected_count is not None and args.expected_count < 1:
         parser.error("--expected-count 必须为正整数。")
-    report = check(args.csv_path, args.expected_count, args.allow_thermal, args.rubric_md)
+    report = check(args.csv_path, args.expected_count, args.allow_thermal)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 1
 
